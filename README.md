@@ -14,7 +14,7 @@ Right click a request row or a request pane:
 - **Paste Cookie Header** replaces the Cookie header in the focused request with the clipboard
 
 Both are in the command palette and can be bound to hotkeys in Caido settings.
-I use CTRL + ALT + C and CTRL + ALT + V respectively 
+I use `CTRL + ALT + C` and `CTRL + ALT + V` respectively 
 
 ## Notes
 
