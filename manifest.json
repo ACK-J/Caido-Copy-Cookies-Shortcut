@@ -1,7 +1,7 @@
 {
   "id": "copy-cookie-header",
   "name": "Copy Cookie Header",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Right click a request to copy its entire Cookie header line to the clipboard.",
   "author": {
     "name": "Jack"

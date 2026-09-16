@@ -5,9 +5,9 @@
  * Paste: right click an editable request pane, replace its Cookie header
  *        with whatever is on the clipboard.
  *
- * Both also work from a keyboard shortcut or the command palette, which
- * fire with CommandContextBase and carry no request, so the target is
- * worked out from the current page selection instead.
+ * Both also work from a keyboard shortcut or the command palette. Those
+ * fire with BaseContext, which carries no request, so the target is worked
+ * out from the current page's own selection instead.
  */
 
 const Commands = {
@@ -235,8 +235,10 @@ async function fetchRawById(sdk, id) {
 /* Target resolution                                                   */
 /* ------------------------------------------------------------------ */
 
-function selectedId(selection) {
-  return selection?.kind === "Selected" ? selection.main : undefined;
+/** Every request id in a page selection, the focused one first. */
+function selectedIds(selection) {
+  if (selection?.kind !== "Selected") return [];
+  return [selection.main, ...(selection.secondary ?? [])].filter((id) => id !== undefined);
 }
 
 function currentPage(sdk) {
@@ -264,81 +266,92 @@ function activeEditor(sdk) {
 }
 
 /**
- * Find the request the user means.
+ * Every place the request could be, best first.
  *
- * A right-click menu supplies it directly. A keyboard shortcut or the
- * command palette supplies CommandContextBase instead, so fall back to
- * the selection reported by the current page, then to the focused editor.
+ * A right-click menu names the request outright. A keyboard shortcut and
+ * the command palette both run with BaseContext, which carries nothing, so
+ * the page's own selection comes next and the focused editor last.
+ *
+ * Sources are lazy and are tried in turn, so a selection that resolves to
+ * nothing, or to a request with no Cookie header, hands over to the next
+ * one instead of ending the search.
  */
-async function resolveRaw(sdk, context) {
-  lastFetchError = "";
+function candidateSources(sdk, context) {
+  const sources = [];
+  const fromId = (label, id) => sources.push({ label, get: () => fetchRawById(sdk, id) });
 
-  if (context?.type === "RequestContext" && context.request?.raw) {
-    return context.request.raw;
-  }
+  let editorAdded = false;
+  const fromEditor = (label) => {
+    if (editorAdded) return;
+    editorAdded = true;
+    sources.push({ label, get: async () => activeEditor(sdk)?.text ?? "" });
+  };
 
-  if (context?.type === "RequestRowContext") {
-    const id = context.requests?.[0]?.id;
-    if (id !== undefined) {
-      const raw = await fetchRawById(sdk, id);
-      if (raw) return raw;
-    }
-  }
+  switch (context?.type) {
+    case "RequestContext":
+      // A Replay draft carries its raw inline; a stored request may only
+      // carry metadata, in which case the id is all there is to go on.
+      if (context.request?.raw) {
+        sources.push({ label: "the request pane", get: async () => context.request.raw });
+      } else if (context.request?.id !== undefined) {
+        fromId(`request #${context.request.id}`, context.request.id);
+      }
+      break;
 
-  if (context?.type === "ResponseContext") {
-    const id = context.request?.id;
-    if (id !== undefined) {
-      const raw = await fetchRawById(sdk, id);
-      if (raw) return raw;
-    }
+    case "RequestRowContext":
+      for (const request of context.requests ?? []) {
+        if (request?.id !== undefined) fromId(`row #${request.id}`, request.id);
+      }
+      break;
+
+    case "ResponseContext":
+      if (context.request?.id !== undefined) {
+        fromId(`request #${context.request.id}`, context.request.id);
+      }
+      break;
+
+    default:
+      break;
   }
 
   const page = currentPage(sdk);
 
   switch (page?.kind) {
-    case "HTTPHistory": {
-      const id = selectedId(page.selection);
-      if (id !== undefined) {
-        const raw = await fetchRawById(sdk, id);
-        if (raw) return raw;
-      }
+    case "HTTPHistory":
+      for (const id of selectedIds(page.selection)) fromId(`HTTP History #${id}`, id);
       break;
-    }
 
-    case "Sitemap": {
-      const id = selectedId(page.requestSelection);
-      if (id !== undefined) {
-        const raw = await fetchRawById(sdk, id);
-        if (raw) return raw;
-      }
+    case "Sitemap":
+      for (const id of selectedIds(page.requestSelection)) fromId(`Sitemap #${id}`, id);
       break;
-    }
 
-    // In Replay the editor holds unsaved edits, so it beats the stored
-    // request. Fall back to the entry if focus is somewhere else.
+    case "Automate":
+      for (const id of selectedIds(page.requestSelection)) fromId(`Automate #${id}`, id);
+      break;
+
+    // In Replay the editor holds unsaved edits, so it beats the stored entry.
     case "Replay": {
-      const live = activeEditor(sdk);
-      if (live) return live.text;
+      fromEditor("the Replay editor");
 
       try {
         const requestId = sdk.replay.getCurrentEntry()?.requestId;
-        if (requestId !== undefined) {
-          const raw = await fetchRawById(sdk, requestId);
-          if (raw) return raw;
-        }
+        if (requestId !== undefined) fromId(`Replay #${requestId}`, requestId);
       } catch {
         /* no current entry */
       }
       break;
     }
 
+    // Intercept reports intercept entry ids, not request ids, and the two
+    // share one numeric space, so looking one up would hand back an
+    // unrelated request. The editor below is the only safe source there.
     default:
       break;
   }
 
-  // Last resort: whatever request pane has focus. In HTTP History the
-  // preview pane counts, so this rescues the case where the id lookup failed.
-  return activeEditor(sdk)?.text ?? "";
+  fromEditor("the focused request pane");
+
+  return sources;
 }
 
 /* ------------------------------------------------------------------ */
@@ -346,9 +359,33 @@ async function resolveRaw(sdk, context) {
 /* ------------------------------------------------------------------ */
 
 async function runCopy(sdk, context) {
-  const raw = await resolveRaw(sdk, context);
+  lastFetchError = "";
 
-  if (!raw) {
+  // Sources that held a request but no Cookie header, named in the toast so
+  // a miss says which request was actually read.
+  const searched = [];
+
+  for (const source of candidateSources(sdk, context)) {
+    const raw = await source.get();
+    if (!raw) continue;
+
+    searched.push(source.label);
+
+    const header = extractCookieHeader(raw);
+    if (!header) continue;
+
+    const copied = await writeClipboard(header);
+
+    sdk.window.showToast(
+      copied
+        ? `Cookie header copied from ${source.label}.`
+        : "Copy Cookie Header: clipboard write failed.",
+      { variant: copied ? "success" : "error", duration: 2000 },
+    );
+    return;
+  }
+
+  if (searched.length === 0) {
     sdk.window.showToast(
       lastFetchError
         ? `Copy Cookie Header: ${lastFetchError}`
@@ -358,20 +395,9 @@ async function runCopy(sdk, context) {
     return;
   }
 
-  const header = extractCookieHeader(raw);
-
-  if (!header) {
-    sdk.window.showToast("Copy Cookie Header: no Cookie header found.", {
-      variant: "warning",
-    });
-    return;
-  }
-
-  const copied = await writeClipboard(header);
-
   sdk.window.showToast(
-    copied ? "Cookie header copied." : "Copy Cookie Header: clipboard write failed.",
-    { variant: copied ? "success" : "error", duration: 2000 },
+    `Copy Cookie Header: no Cookie header in ${searched.join(", ")}.`,
+    { variant: "warning", duration: 6000 },
   );
 }
 
@@ -462,7 +488,7 @@ async function runDiagnose(sdk) {
     }
   }
 
-  const id = selectedId(page?.selection) ?? selectedId(page?.requestSelection);
+  const [id] = [...selectedIds(page?.selection), ...selectedIds(page?.requestSelection)];
   out.push(`resolved id: ${show(id)} (typeof ${typeof id})`);
 
   if (id !== undefined) {
@@ -481,6 +507,30 @@ async function runDiagnose(sdk) {
     } catch (e) {
       out.push(`graphql threw: ${e?.name ?? ""} ${e?.message ?? e}`);
     }
+  }
+
+  // Walk the same sources a copy would, so the report shows where the
+  // request came from and which sources came up short.
+  lastFetchError = "";
+  out.push("candidates, as a keyboard shortcut sees them:");
+
+  for (const source of candidateSources(sdk, undefined)) {
+    let raw = "";
+    try {
+      raw = await source.get();
+    } catch (e) {
+      out.push(`  ${source.label}: threw ${e?.message ?? e}`);
+      continue;
+    }
+
+    if (!raw) {
+      out.push(`  ${source.label}: empty`);
+      continue;
+    }
+
+    const text = normalizeRaw(raw);
+    out.push(`  ${source.label}: ${text.length} chars, ${show(text.split(/\r?\n/)[0]?.slice(0, 60))}`);
+    out.push(`    cookie: ${show(extractCookieHeader(raw).slice(0, 40))}`);
   }
 
   out.push(`lastFetchError: ${lastFetchError || "none"}`);
