@@ -10,11 +10,35 @@
  * out from the current page's own selection instead.
  */
 
-const Commands = {
-  copy: "copy-cookie-header.copy",
-  paste: "copy-cookie-header.paste",
-  diagnose: "copy-cookie-header.diagnose",
+/**
+ * The headers this plugin moves around.
+ *
+ * `join` is what to do when a request carries the header more than once:
+ * a cookie list is routinely split across several headers on HTTP/2 and the
+ * pieces belong together, while a second Authorization header is a mistake,
+ * so the first one wins.
+ *
+ * The cookie command ids are the original ones. They are what any existing
+ * keyboard shortcut is bound to, so they do not change.
+ */
+const Headers = {
+  cookie: {
+    name: "Cookie",
+    join: "; ",
+    copyId: "copy-cookie-header.copy",
+    pasteId: "copy-cookie-header.paste",
+    copyIcon: "fas fa-cookie-bite",
+  },
+  authorization: {
+    name: "Authorization",
+    join: null,
+    copyId: "copy-cookie-header.copy-authorization",
+    pasteId: "copy-cookie-header.paste-authorization",
+    copyIcon: "fas fa-key",
+  },
 };
+
+const DIAGNOSE_COMMAND = "copy-cookie-header.diagnose";
 
 const REQUEST_LINE = /^[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]* \S+ HTTP\/\d/;
 
@@ -68,10 +92,12 @@ function headerLines(text) {
 }
 
 /**
- * Indexes of the lines making up the Cookie header, including any
- * obs-fold continuation lines that belong to it.
+ * Indexes of the lines making up one header, including any obs-fold
+ * continuation lines that belong to it. Header names are case insensitive,
+ * which also covers the lowercase names HTTP/2 uses.
  */
-function cookieLineIndexes(lines) {
+function headerLineIndexes(lines, name) {
+  const wanted = name.toLowerCase();
   const found = [];
 
   for (let i = 1; i < lines.length; i++) {
@@ -84,21 +110,19 @@ function cookieLineIndexes(lines) {
 
     const colon = line.indexOf(":");
     if (colon === -1) continue;
-    if (line.slice(0, colon).trim().toLowerCase() === "cookie") found.push(i);
+    if (line.slice(0, colon).trim().toLowerCase() === wanted) found.push(i);
   }
 
   return found;
 }
 
-/** Build the full "Cookie: ..." line from a raw request, or "" if absent. */
-function extractCookieHeader(raw) {
+/** Build the full "Name: ..." line from a raw request, or "" if absent. */
+function extractHeader(raw, spec) {
   const text = normalizeRaw(raw);
   const lines = headerLines(text);
-  const indexes = cookieLineIndexes(lines);
+  const indexes = headerLineIndexes(lines, spec.name);
   if (indexes.length === 0) return "";
 
-  // An HTTP/2 cookie list is often split across several headers. Join the
-  // values so the result pastes cleanly as one line.
   const values = [];
   let current = null;
 
@@ -113,30 +137,49 @@ function extractCookieHeader(raw) {
   }
   if (current !== null) values.push(current);
 
-  const joined = values.filter(Boolean).join("; ");
-  return joined ? `Cookie: ${joined}` : "";
+  const present = values.filter(Boolean);
+  const value = spec.join === null ? present[0] : present.join(spec.join);
+
+  return value ? `${spec.name}: ${value}` : "";
 }
 
 /* ------------------------------------------------------------------ */
 /* Paste planning                                                      */
 /* ------------------------------------------------------------------ */
 
-function normalizeClipboard(clip) {
+/**
+ * Turn whatever is on the clipboard into one header line.
+ *
+ * Returns `{ header }`, or `{ mismatch }` when the clipboard holds one of
+ * the other headers this plugin copies. Both commands share a single
+ * clipboard, so that is a slip worth naming rather than pasting
+ * "Authorization: Cookie: sid=1" into the request.
+ */
+function normalizeClipboard(clip, spec) {
   const collapsed = String(clip ?? "").replace(/\s*\r?\n\s*/g, " ").trim();
-  if (!collapsed) return "";
+  if (!collapsed) return {};
 
+  // Accept a whole header line or a bare value. Only this header's own name
+  // is stripped, so pasting "Bearer x" keeps every word of the value.
   const colon = collapsed.indexOf(":");
-  if (colon !== -1 && collapsed.slice(0, colon).trim().toLowerCase() === "cookie") {
+  const prefix = colon === -1 ? "" : collapsed.slice(0, colon).trim().toLowerCase();
+
+  if (prefix === spec.name.toLowerCase()) {
     const value = collapsed.slice(colon + 1).trim();
-    return value ? `Cookie: ${value}` : "";
+    return value ? { header: `${spec.name}: ${value}` } : {};
   }
 
-  return `Cookie: ${collapsed}`;
+  const other = Object.values(Headers).find(
+    (h) => h !== spec && h.name.toLowerCase() === prefix,
+  );
+  if (other) return { mismatch: other.name };
+
+  return { header: `${spec.name}: ${collapsed}` };
 }
 
-function planCookiePaste(text, header) {
+function planHeaderPaste(text, spec, header) {
   const lines = headerLines(text);
-  const indexes = cookieLineIndexes(lines);
+  const indexes = headerLineIndexes(lines, spec.name);
 
   if (indexes.length === 0) {
     const lineBreak = text.includes("\r\n") ? "\r\n" : "\n";
@@ -358,10 +401,10 @@ function candidateSources(sdk, context) {
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
-async function runCopy(sdk, context) {
+async function runCopy(sdk, spec, context) {
   lastFetchError = "";
 
-  // Sources that held a request but no Cookie header, named in the toast so
+  // Sources that held a request but not this header, named in the toast so
   // a miss says which request was actually read.
   const searched = [];
 
@@ -371,15 +414,15 @@ async function runCopy(sdk, context) {
 
     searched.push(source.label);
 
-    const header = extractCookieHeader(raw);
+    const header = extractHeader(raw, spec);
     if (!header) continue;
 
     const copied = await writeClipboard(header);
 
     sdk.window.showToast(
       copied
-        ? `Cookie header copied from ${source.label}.`
-        : "Copy Cookie Header: clipboard write failed.",
+        ? `${spec.name} header copied from ${source.label}.`
+        : `Copy ${spec.name} Header: clipboard write failed.`,
       { variant: copied ? "success" : "error", duration: 2000 },
     );
     return;
@@ -388,24 +431,24 @@ async function runCopy(sdk, context) {
   if (searched.length === 0) {
     sdk.window.showToast(
       lastFetchError
-        ? `Copy Cookie Header: ${lastFetchError}`
-        : "Copy Cookie Header: no request found. Select a row or focus a request pane.",
+        ? `Copy ${spec.name} Header: ${lastFetchError}`
+        : `Copy ${spec.name} Header: no request found. Select a row or focus a request pane.`,
       { variant: "warning", duration: 6000 },
     );
     return;
   }
 
   sdk.window.showToast(
-    `Copy Cookie Header: no Cookie header in ${searched.join(", ")}.`,
+    `Copy ${spec.name} Header: no ${spec.name} header in ${searched.join(", ")}.`,
     { variant: "warning", duration: 6000 },
   );
 }
 
-async function runPaste(sdk) {
+async function runPaste(sdk, spec) {
   const target = activeEditor(sdk);
 
   if (!target) {
-    sdk.window.showToast("Paste Cookie Header: focus a request editor first.", {
+    sdk.window.showToast(`Paste ${spec.name} Header: focus a request editor first.`, {
       variant: "warning",
     });
     return;
@@ -413,7 +456,7 @@ async function runPaste(sdk) {
 
   if (target.editor.isReadOnly()) {
     sdk.window.showToast(
-      "Paste Cookie Header: this request is read only. Use a Replay tab.",
+      `Paste ${spec.name} Header: this request is read only. Use a Replay tab.`,
       { variant: "warning" },
     );
     return;
@@ -422,29 +465,37 @@ async function runPaste(sdk) {
   const clip = await readClipboard();
 
   if (clip === null) {
-    sdk.window.showToast("Paste Cookie Header: could not read the clipboard.", {
+    sdk.window.showToast(`Paste ${spec.name} Header: could not read the clipboard.`, {
       variant: "error",
     });
     return;
   }
 
-  const header = normalizeClipboard(clip);
+  const { header, mismatch } = normalizeClipboard(clip, spec);
+
+  if (mismatch) {
+    sdk.window.showToast(
+      `Paste ${spec.name} Header: the clipboard holds ${/^[aeiou]/i.test(mismatch) ? "an" : "a"} ${mismatch} header. Copy ${spec.name} first.`,
+      { variant: "warning", duration: 6000 },
+    );
+    return;
+  }
 
   if (!header) {
-    sdk.window.showToast("Paste Cookie Header: clipboard is empty.", {
+    sdk.window.showToast(`Paste ${spec.name} Header: clipboard is empty.`, {
       variant: "warning",
     });
     return;
   }
 
-  const changes = planCookiePaste(target.text, header);
+  const changes = planHeaderPaste(target.text, spec, header);
   const replaced = changes[0].to > changes[0].from;
 
   target.editor.getEditorView().dispatch({ changes });
   target.editor.focus();
 
   sdk.window.showToast(
-    replaced ? "Cookie header replaced." : "Cookie header added.",
+    replaced ? `${spec.name} header replaced.` : `${spec.name} header added.`,
     { variant: "success", duration: 2000 },
   );
 }
@@ -530,7 +581,9 @@ async function runDiagnose(sdk) {
 
     const text = normalizeRaw(raw);
     out.push(`  ${source.label}: ${text.length} chars, ${show(text.split(/\r?\n/)[0]?.slice(0, 60))}`);
-    out.push(`    cookie: ${show(extractCookieHeader(raw).slice(0, 40))}`);
+    for (const spec of Object.values(Headers)) {
+      out.push(`    ${spec.name}: ${show(extractHeader(raw, spec).slice(0, 40))}`);
+    }
   }
 
   out.push(`lastFetchError: ${lastFetchError || "none"}`);
@@ -546,40 +599,43 @@ async function runDiagnose(sdk) {
 }
 
 export const init = (sdk) => {
-  sdk.commands.register(Commands.copy, {
-    name: "Copy Cookie Header",
-    run: (context) => runCopy(sdk, context),
-  });
+  for (const spec of Object.values(Headers)) {
+    sdk.commands.register(spec.copyId, {
+      name: `Copy ${spec.name} Header`,
+      run: (context) => runCopy(sdk, spec, context),
+    });
 
-  sdk.commands.register(Commands.paste, {
-    name: "Paste Cookie Header",
-    run: () => runPaste(sdk),
-  });
+    sdk.commands.register(spec.pasteId, {
+      name: `Paste ${spec.name} Header`,
+      run: () => runPaste(sdk, spec),
+    });
 
-  sdk.commands.register(Commands.diagnose, {
+    sdk.commandPalette.register(spec.copyId);
+    sdk.commandPalette.register(spec.pasteId);
+
+    sdk.menu.registerItem({
+      type: "RequestRow",
+      commandId: spec.copyId,
+      leadingIcon: spec.copyIcon,
+    });
+    sdk.menu.registerItem({
+      type: "Request",
+      commandId: spec.copyId,
+      leadingIcon: spec.copyIcon,
+    });
+
+    // Paste needs a writable editor, so it only goes on the request pane.
+    sdk.menu.registerItem({
+      type: "Request",
+      commandId: spec.pasteId,
+      leadingIcon: "fas fa-paste",
+    });
+  }
+
+  sdk.commands.register(DIAGNOSE_COMMAND, {
     name: "Copy Cookie Header: Diagnostics",
     run: () => runDiagnose(sdk),
   });
 
-  sdk.commandPalette.register(Commands.copy);
-  sdk.commandPalette.register(Commands.paste);
-  sdk.commandPalette.register(Commands.diagnose);
-
-  sdk.menu.registerItem({
-    type: "RequestRow",
-    commandId: Commands.copy,
-    leadingIcon: "fas fa-cookie-bite",
-  });
-  sdk.menu.registerItem({
-    type: "Request",
-    commandId: Commands.copy,
-    leadingIcon: "fas fa-cookie-bite",
-  });
-
-  // Paste needs a writable editor, so it only goes on the request pane.
-  sdk.menu.registerItem({
-    type: "Request",
-    commandId: Commands.paste,
-    leadingIcon: "fas fa-paste",
-  });
+  sdk.commandPalette.register(DIAGNOSE_COMMAND);
 };

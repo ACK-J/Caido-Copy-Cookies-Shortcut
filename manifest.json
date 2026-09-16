@@ -1,8 +1,8 @@
 {
   "id": "copy-cookie-header",
   "name": "Copy Cookie Header",
-  "version": "1.3.0",
-  "description": "Right click a request to copy its entire Cookie header line to the clipboard.",
+  "version": "1.4.0",
+  "description": "Copy the Cookie or Authorization header off one request and paste it into another.",
   "author": {
     "name": "Jack"
   },
